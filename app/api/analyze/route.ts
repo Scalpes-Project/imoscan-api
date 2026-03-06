@@ -76,7 +76,31 @@ export async function POST(req: NextRequest) {
 
   // 3. Build request
   const requestId = uuidv4();
-  const userMessage = JSON.stringify({
+  
+  const schemaReminder = `
+RAPPEL SCHÉMA JSON OBLIGATOIRE — respectez EXACTEMENT ces clés et types :
+
+{
+  "ok": true,
+  "requestId": "${requestId}",
+  "meta": { "tone": "VOUVOIEMENT", "version": "analyze_v3_2", "mode": "${mode}" },
+  "source": { "url": null, "provider": "seloger"|"leboncoin"|"pap"|"unknown", "capturedAt": null },
+  "verdict": { "decision": "VISITEZ"|"NÉGOCIEZ"|"ÉCARTEZ", "signals": "PRÉCIS"|"PARTIEL"|"FLOU", "signalWhy": ["..."], "oneLine": "..." },
+  "narrativeReading": { "whatYouReallyBuy": "...", "blindSpots": [{ "topic": "...", "whatsMissing": "...", "whyItCosts": "..." }], "priceBasis": "..." },
+  "dimensionScores": [{ "axis": "readability", "score": 1-10, "comment": "..." }, { "axis": "coproRisk", ... }, { "axis": "priceDefensibility", ... }, { "axis": "usageQuality", ... }, { "axis": "liquidity", ... }],
+  "proofs": { "quickFacts": [{ "label": "...", "value": "..." }], "priceDefensibility": { "status": "DÉFENDABLE"|"FRAGILE"|"INJUSTIFIABLE", "rationale": ["..."] }, "documentsIndex": [{ "doc": "...", "status": "OK"|"MISSING"|"UNKNOWN", "why": "..." }] },
+  "reasons": [{ "title": "...", "impact": "...", "evidence": ["..."] }],
+  "redFlags": [{ "label": "...", "severity": "LOW"|"MEDIUM"|"HIGH", "whyItMatters": "...", "ask": "..." }],
+  "ammo": { "asks": [{ "title": "...", "priority": "P0"|"P1"|"P2", "whatToRequest": ["..."], "why": "..." }], "preVisitQuestions": [{ "question": "...", "whyBeforeVisit": "..." }], "visitChecklist": [{ "q": "...", "tag": "..." }], "negotiationLevers": [{ "lever": "...", "use": "...", "script": "..." }] },
+  "offer": { "available": true|false, "positioning": "...", "scenarios": [{ "name": "...", "offerEUR": null, "conditions": ["..."], "whyThisWorks": "..." }], "agentMessageTemplate": "..." },
+  "cta": { "primary": { "label": "...", "action": "NEW_SCAN"|"COPY_AGENT_MESSAGE" }, "secondary": { "label": "...", "action": "NEW_SCAN"|"UPSELL_OFFER_DOSSIER"|"SUBSCRIBE" } },
+  "disclaimer": ["IMOSCAN est une aide à la décision. Pas une garantie.", "IMOSCAN tranche sur ce qui est visible et fourni."]
+}
+
+IMPORTANT : offerEUR = null (pas de context.marketRefs fourni). Pas de ranges.
+`;
+
+  const userMessage = schemaReminder + "\n\nAnalysez cette annonce :\n\n" + JSON.stringify({
     requestId,
     normalizedText,
     mode,
