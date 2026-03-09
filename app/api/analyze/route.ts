@@ -8,7 +8,7 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 1000;
+const MAX_TOKENS_COMPACT = 1500;
 const MAX_TOKENS_DOSSIER = 4000;
 const TEMPERATURE = 0.2;
 const TIMEOUT_MS = 45_000;
