@@ -11,7 +11,7 @@ const MODEL = "claude-sonnet-4-20250514";
 const MAX_TOKENS = 4000;
 const TEMPERATURE = 0.2;
 const TIMEOUT_MS = 45_000;
-const MIN_TEXT_LENGTH = 150;
+const MIN_TEXT_LENGTH = 100;
 
 // --- CORS preflight ---
 export async function OPTIONS() {
