@@ -134,7 +134,7 @@ export async function POST(req: NextRequest) {
     return errorResponse("BAD_INPUT", "normalizedText requis.", 400);
   }
   if (normalizedText.length < MIN_TEXT_LENGTH) {
-    return errorResponse("TOO_SHORT", "Texte trop court. Collez l'annonce complete.", 400);
+    return errorResponse("TOO_SHORT", "Texte trop court. Collez l annonce complete.", 400);
   }
   if (!["COMPACT", "DOSSIER"].includes(mode)) {
     return errorResponse("BAD_INPUT", "mode doit etre COMPACT ou DOSSIER.", 400);
@@ -142,12 +142,14 @@ export async function POST(req: NextRequest) {
 
   const requestId = uuidv4();
 
-  const userMessage = `Analysez cette annonce. Repondez UNIQUEMENT en JSON valide, sans texte avant ou apres.
+  const userMessage = `Repondez UNIQUEMENT en JSON valide. Pas de texte avant ou apres le JSON.
 requestId: "${requestId}", mode: "${mode}".
-offerEUR = null (pas de marketRefs). Pas de ranges. Pas de pourcentages inventes.
-COMPACT: reasons 2 max, redFlags 2 max, asks 3 max, preVisitQuestions 3 max, visitChecklist 5 max, quickFacts 4 max, documentsIndex 2 max, blindSpots 3 max, whatYouReallyBuy 2 phrases max.
-Si ECARTEZ: cta.primary NEW_SCAN, pas de secondary. Sinon: cta.primary COPY_AGENT_MESSAGE, secondary NEW_SCAN.
-Pas d accusation d intention (manipulation, strategie, suspect). Constats uniquement.
+
+JSON attendu: { ok, requestId, meta, source, verdict:{decision,signals,signalWhy,oneLine}, narrativeReading:{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores, proofs:{quickFacts,priceDefensibility,documentsIndex}, reasons, redFlags, ammo:{asks,preVisitQuestions,visitChecklist}, offer:{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer }
+
+Regles: offerEUR=null, pas de ranges, pas de pourcentages inventes, constats uniquement.
+COMPACT: reasons 2, redFlags 2, asks 3, preVisitQuestions 3, visitChecklist 5, quickFacts 4, documentsIndex 2, blindSpots 3.
+ECARTEZ: cta.primary NEW_SCAN, pas de secondary. Sinon: cta.primary COPY_AGENT_MESSAGE.
 
 Annonce:
 ${normalizedText}`;
