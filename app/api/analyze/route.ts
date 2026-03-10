@@ -8,10 +8,9 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 2000; // ↓ was 2000 (reduces latency a lot)
-const MAX_TOKENS_DOSSIER = 4000;
+const MAX_TOKENS = 2000;
 const TEMPERATURE = 0.2;
-const TIMEOUT_MS = 45_000;
+const TIMEOUT_MS = 55_000;
 const MIN_TEXT_LENGTH = 100;
 
 // --- CORS preflight ---
@@ -48,19 +47,16 @@ function errorResponse(code: string, message: string, status: number) {
 
 function normalizeEnums(data: unknown): void {
   const d = data as Record<string, unknown>;
-
   const verdict = d.verdict as Record<string, unknown> | undefined;
   if (verdict) {
     const decisionMap: Record<string, string> = {
-      ECARTEZ: "\u00C9CARTEZ",
-      NEGOCIEZ: "N\u00C9GOCIEZ",
-      // Rare case: combined accent variant
-      ÉCARTEZ: "\u00C9CARTEZ",
+      "ECARTEZ": "\u00C9CARTEZ",
+      "NEGOCIEZ": "N\u00C9GOCIEZ",
+      "\u00C9CARTEZ": "\u00C9CARTEZ",
     };
     const signalMap: Record<string, string> = {
-      PRECIS: "PR\u00C9CIS",
+      "PRECIS": "PR\u00C9CIS",
     };
-
     if (typeof verdict.decision === "string" && decisionMap[verdict.decision]) {
       verdict.decision = decisionMap[verdict.decision];
     }
@@ -68,73 +64,50 @@ function normalizeEnums(data: unknown): void {
       verdict.signals = signalMap[verdict.signals];
     }
   }
-
   const proofs = d.proofs as Record<string, unknown> | undefined;
   if (proofs) {
     const pd = proofs.priceDefensibility as Record<string, unknown> | undefined;
-    const statusMap: Record<string, string> = { DEFENDABLE: "D\u00C9FENDABLE" };
+    const statusMap: Record<string, string> = { "DEFENDABLE": "D\u00C9FENDABLE" };
     if (pd && typeof pd.status === "string" && statusMap[pd.status]) {
       pd.status = statusMap[pd.status];
     }
   }
 }
 
-/**
- * Post-processing sanitizer:
- * - Fixes recurring typos in titles
- * - Softens "intent attribution" language in Scalpes fields (non-destructive)
- * - Forces CTA coherence based on decision
- *
- * NOTE: Keep sanitizer minimal; avoid rewriting semantics beyond small safe substitutions.
- */
 function sanitizeOutput(data: unknown): void {
   const d = data as any;
   if (!d || typeof d !== "object") return;
 
   const fixTypos = (s: string): string =>
-    s
-      .replace(/compl[eè]vos/gi, "complètes")
-      .replace(/compl[eè]ves/gi, "complètes");
+    s.replace(/compl[e\u00E8]vos/gi, "compl\u00E8tes").replace(/compl[e\u00E8]ves/gi, "compl\u00E8tes");
 
-  // Replace intent/accusation-ish words with neutral constat terms (light touch)
   const softenIntent = (s: string): string =>
     s
-      .replace(/\b[Ss]trat[ée]gie\b/g, "Opacité")
-      .replace(/\bmanipulation\b/gi, "asymétrie d'information")
-      .replace(/\b(suspect|suspecte|suspects|suspectes)\b/gi, "non vérifiable")
-      .replace(/\bmasquer\b/gi, "couvrir");
+      .replace(/\b[Ss]trat(?:e|\u00E9|\u00E8)gie\b/g, "Opacit\u00E9")
+      .replace(/\bmanipulation\b/gi, "asym\u00E9trie d'information")
+      .replace(/\b(suspect|suspecte|suspects|suspectes)\b/gi, "non v\u00E9rifiable")
+      .replace(/\bmasquer\b/gi, "couvrir")
+      .replace(/\b[e\u00E9]vitement\b/gi, "opacit\u00E9");
 
-  // Fix ammo.asks[].title
   if (d.ammo?.asks && Array.isArray(d.ammo.asks)) {
     for (const ask of d.ammo.asks) {
-      if (ask && typeof ask.title === "string") {
-        ask.title = fixTypos(ask.title);
-      }
+      if (ask && typeof ask.title === "string") ask.title = fixTypos(ask.title);
     }
   }
-
-  // Soften intent in redFlags[].whyItMatters
   if (d.redFlags && Array.isArray(d.redFlags)) {
     for (const rf of d.redFlags) {
-      if (rf && typeof rf.whyItMatters === "string") {
-        rf.whyItMatters = softenIntent(rf.whyItMatters);
-      }
+      if (rf && typeof rf.whyItMatters === "string") rf.whyItMatters = softenIntent(rf.whyItMatters);
     }
   }
-
-  // Soften intent in reasons[].impact
   if (d.reasons && Array.isArray(d.reasons)) {
     for (const r of d.reasons) {
-      if (r && typeof r.impact === "string") {
-        r.impact = softenIntent(r.impact);
-      }
+      if (r && typeof r.impact === "string") r.impact = softenIntent(r.impact);
     }
   }
 
-  // Force CTA coherence
   const decision: string | undefined = d.verdict?.decision;
   if (d.cta && decision) {
-    if (decision === "ÉCARTEZ" || decision === "ECARTEZ") {
+    if (decision === "\u00C9CARTEZ" || decision === "ECARTEZ") {
       d.cta.primary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
       delete d.cta.secondary;
     } else {
@@ -152,7 +125,7 @@ export async function POST(req: NextRequest) {
   try {
     body = await req.json();
   } catch {
-    return errorResponse("BAD_INPUT", "Corps de requête invalide.", 400);
+    return errorResponse("BAD_INPUT", "Corps de requete invalide.", 400);
   }
 
   const { normalizedText, mode = "COMPACT", context } = body;
@@ -161,73 +134,27 @@ export async function POST(req: NextRequest) {
     return errorResponse("BAD_INPUT", "normalizedText requis.", 400);
   }
   if (normalizedText.length < MIN_TEXT_LENGTH) {
-    return errorResponse("TOO_SHORT", "Texte trop court. Collez l'annonce complète.", 400);
+    return errorResponse("TOO_SHORT", "Texte trop court. Collez l'annonce complete.", 400);
   }
   if (!["COMPACT", "DOSSIER"].includes(mode)) {
-    return errorResponse("BAD_INPUT", "mode doit être COMPACT ou DOSSIER.", 400);
+    return errorResponse("BAD_INPUT", "mode doit etre COMPACT ou DOSSIER.", 400);
   }
 
   const requestId = uuidv4();
-  const maxTokens = mode === "DOSSIER" ? MAX_TOKENS_DOSSIER : MAX_TOKENS_COMPACT;
 
-  const schemaReminder = `
-RAPPEL SCHEMA JSON OBLIGATOIRE — respectez EXACTEMENT ces cles et types :
+  const userMessage = `Analysez cette annonce. Repondez UNIQUEMENT en JSON valide, sans texte avant ou apres.
+requestId: "${requestId}", mode: "${mode}".
+offerEUR = null (pas de marketRefs). Pas de ranges. Pas de pourcentages inventes.
+COMPACT: reasons 2 max, redFlags 2 max, asks 3 max, preVisitQuestions 3 max, visitChecklist 5 max, quickFacts 4 max, documentsIndex 2 max, blindSpots 3 max, whatYouReallyBuy 2 phrases max.
+Si ECARTEZ: cta.primary NEW_SCAN, pas de secondary. Sinon: cta.primary COPY_AGENT_MESSAGE, secondary NEW_SCAN.
+Pas d accusation d intention (manipulation, strategie, suspect). Constats uniquement.
 
-{
-  "ok": true,
-  "requestId": "${requestId}",
-  "meta": { "tone": "VOUVOIEMENT", "version": "analyze_v3_2", "mode": "${mode}" },
-  "source": { "url": null, "provider": "seloger"|"leboncoin"|"pap"|"unknown", "capturedAt": null },
-  "verdict": { "decision": "VISITEZ"|"NEGOCIEZ"|"ECARTEZ", "signals": "PRECIS"|"PARTIEL"|"FLOU", "signalWhy": ["..."], "oneLine": "..." },
-  "narrativeReading": { "whatYouReallyBuy": "...", "blindSpots": [{ "topic": "...", "whatsMissing": "...", "whyItCosts": "..." }], "priceBasis": "..." },
-  "dimensionScores": [{ "axis": "readability", "score": 1-10, "comment": "..." }, { "axis": "coproRisk", ... }, { "axis": "priceDefensibility", ... }, { "axis": "usageQuality", ... }, { "axis": "liquidity", ... }],
-  "proofs": { "quickFacts": [{ "label": "...", "value": "..." }], "priceDefensibility": { "status": "DEFENDABLE"|"FRAGILE"|"INJUSTIFIABLE", "rationale": ["..."] }, "documentsIndex": [{ "doc": "...", "status": "OK"|"MISSING"|"UNKNOWN", "why": "..." }] },
-  "reasons": [{ "title": "...", "impact": "...", "evidence": ["..."] }],
-  "redFlags": [{ "label": "...", "severity": "LOW"|"MEDIUM"|"HIGH", "whyItMatters": "...", "ask": "..." }],
-  "ammo": { "asks": [{ "title": "...", "priority": "P0"|"P1"|"P2", "whatToRequest": ["..."], "why": "..." }], "preVisitQuestions": [{ "question": "...", "whyBeforeVisit": "..." }], "visitChecklist": [{ "q": "...", "tag": "..." }], "negotiationLevers": [{ "lever": "...", "use": "...", "script": "..." }] },
-  "offer": { "available": true|false, "positioning": "...", "scenarios": [{ "name": "...", "offerEUR": null, "conditions": ["..."], "whyThisWorks": "..." }], "agentMessageTemplate": "..." },
-  "cta": { "primary": { "label": "...", "action": "NEW_SCAN"|"COPY_AGENT_MESSAGE" }, "secondary": { "label": "...", "action": "NEW_SCAN"|"UPSELL_OFFER_DOSSIER"|"SUBSCRIBE" } },
-  "disclaimer": ["IMOSCAN est une aide a la decision. Pas une garantie.", "IMOSCAN tranche sur ce qui est visible et fourni."]
-}
-
-IMPORTANT : offerEUR = null (pas de context.marketRefs fourni). Pas de ranges.
-IMPORTANT : aucun pourcentage de decote, aucun "euros de trop", aucun "standard marche" invente. Qualifications uniquement (FRAGILE, probable decote, risque).
-IMPORTANT : aucune faute d orthographe dans les labels et titres.
-
-MODE COMPACT — LIMITES STRICTES :
-- reasons: 2 max
-- redFlags: 2 max
-- ammo.asks: 3 max
-- ammo.preVisitQuestions: 3 max
-- ammo.visitChecklist: 5 max
-- proofs.quickFacts: 4 max
-- proofs.documentsIndex: 2 max
-- narrativeReading.whatYouReallyBuy: 2 phrases max
-- narrativeReading.blindSpots: 3 max
-- Phrases courtes partout. Pas de verbosite.
-
-REGISTRE SCALPES — INTERDICTIONS SUPPLEMENTAIRES :
-- Interdit d attribuer une intention ("manipulation", "strategie", "suspect", "trompeur").
-- Remplacer par des constats : "opacite", "non documente", "non verifiable", "asymetrie d information".
-
-CTA — COHERENCE :
-- Si decision = ECARTEZ : cta.primary = {"label":"Scanner une autre annonce","action":"NEW_SCAN"}. Pas de cta.secondary.
-- Si decision != ECARTEZ : cta.primary = {"label":"Copier le message agent","action":"COPY_AGENT_MESSAGE"}, cta.secondary = {"label":"Scanner une autre annonce","action":"NEW_SCAN"}
-`;
-
-  const userMessage =
-    schemaReminder +
-    "\n\nAnalysez cette annonce :\n\n" +
-    JSON.stringify({
-      requestId,
-      normalizedText,
-      mode,
-      ...(context ? { context } : {}),
-    });
+Annonce:
+${normalizedText}`;
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
-    return errorResponse("SERVER_ERROR", "Clé API manquante.", 500);
+    return errorResponse("SERVER_ERROR", "Cle API manquante.", 500);
   }
 
   const client = new Anthropic({ apiKey });
@@ -240,7 +167,7 @@ CTA — COHERENCE :
     const response = await client.messages.create(
       {
         model: MODEL,
-        max_tokens: maxTokens,
+        max_tokens: MAX_TOKENS,
         temperature: TEMPERATURE,
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: userMessage }],
@@ -252,16 +179,16 @@ CTA — COHERENCE :
 
     const textBlock = response.content.find((b) => b.type === "text");
     if (!textBlock || textBlock.type !== "text") {
-      return errorResponse("SERVER_ERROR", "Réponse vide du modèle.", 500);
+      return errorResponse("SERVER_ERROR", "Reponse vide du modele.", 500);
     }
     rawText = textBlock.text;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Erreur API";
     console.error("[IMOSCAN] Claude API error:", message);
     if (message.includes("abort")) {
-      return errorResponse("TIMEOUT", "Délai dépassé. Réessayez.", 504);
+      return errorResponse("TIMEOUT", "Delai depasse. Reessayez.", 504);
     }
-    return errorResponse("SERVER_ERROR", "Erreur d'analyse. Réessayez.", 500);
+    return errorResponse("SERVER_ERROR", "Erreur d analyse. Reessayez.", 500);
   }
 
   let parsed = safeJsonParse(rawText);
@@ -271,7 +198,7 @@ CTA — COHERENCE :
     try {
       const retryResponse = await client.messages.create({
         model: MODEL,
-        max_tokens: maxTokens,
+        max_tokens: MAX_TOKENS,
         temperature: 0.1,
         system: SYSTEM_PROMPT,
         messages: [
@@ -279,8 +206,7 @@ CTA — COHERENCE :
           { role: "assistant", content: rawText },
           {
             role: "user",
-            content:
-              "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après.",
+            content: "Votre reponse precedente n est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrige, sans texte avant ou apres.",
           },
         ],
       });
@@ -294,14 +220,11 @@ CTA — COHERENCE :
     }
 
     if (!parsed) {
-      return errorResponse("BAD_JSON", "Impossible de produire un verdict valide. Réessayez.", 500);
+      return errorResponse("BAD_JSON", "Impossible de produire un verdict valide. Reessayez.", 500);
     }
   }
 
-  // Normalize enums (fix accent-less outputs from model)
   normalizeEnums(parsed);
-
-  // Sanitize output (typos + soften intent + CTA coherence)
   sanitizeOutput(parsed);
 
   const validation = validateAnalyzeResult(parsed);
