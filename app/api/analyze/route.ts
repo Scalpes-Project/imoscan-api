@@ -8,7 +8,7 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 1100;
+const MAX_TOKENS_COMPACT = 900;
 const MAX_TOKENS_DOSSIER = 4000;
 const TEMPERATURE = 0.2;
 const TIMEOUT_MS = 55_000;
@@ -29,9 +29,19 @@ export async function OPTIONS() {
 // --- Helpers ---
 function safeJsonParse(raw: string): unknown | null {
   let cleaned = raw.trim();
+
+  // Strip fenced code blocks if present
   if (cleaned.startsWith("```")) {
-    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "").trim();
+    cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
   }
+
+  // Try to extract JSON object boundaries if extra text exists
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    cleaned = cleaned.slice(firstBrace, lastBrace + 1).trim();
+  }
+
   try {
     return JSON.parse(cleaned);
   } catch {
@@ -54,11 +64,9 @@ function normalizeEnums(data: unknown): void {
     const decisionMap: Record<string, string> = {
       ECARTEZ: "ÉCARTEZ",
       NEGOCIEZ: "NÉGOCIEZ",
-      "ÉCARTEZ": "ÉCARTEZ", // accent combiné rare
+      "ÉCARTEZ": "ÉCARTEZ", // rare composed accent
     };
-    const signalMap: Record<string, string> = {
-      PRECIS: "PRÉCIS",
-    };
+    const signalMap: Record<string, string> = { PRECIS: "PRÉCIS" };
 
     if (typeof verdict.decision === "string" && decisionMap[verdict.decision]) {
       verdict.decision = decisionMap[verdict.decision];
@@ -85,7 +93,7 @@ function sanitizeOutput(data: unknown): void {
   const fixTypos = (s: string): string =>
     s.replace(/compl[eè]vos/gi, "complètes").replace(/compl[eè]ves/gi, "complètes");
 
-  // Non-destructive softening of intent attribution / accusation-ish words
+  // Light “intent” softener (server-side guardrail)
   const softenIntent = (s: string): string =>
     s
       .replace(/\b[Ss]trat(?:e|é|è)gie\b/g, "Opacité")
@@ -95,7 +103,7 @@ function sanitizeOutput(data: unknown): void {
       .replace(/\b(cach(e|er|ée|ées|és)|dissimule|rétention|retention)\b/gi, "non documenté")
       .replace(/\b(evitement|évitement)\b/gi, "opacité");
 
-  // Fix ammo.asks[].title
+  // Fix ammo.asks[].title + soften why
   if (d.ammo?.asks && Array.isArray(d.ammo.asks)) {
     for (const ask of d.ammo.asks) {
       if (ask && typeof ask.title === "string") ask.title = fixTypos(ask.title);
@@ -103,7 +111,7 @@ function sanitizeOutput(data: unknown): void {
     }
   }
 
-  // Soften intent in redFlags / reasons
+  // Soften intent-ish phrasing in redFlags/reasons
   if (d.redFlags && Array.isArray(d.redFlags)) {
     for (const rf of d.redFlags) {
       if (rf && typeof rf.whyItMatters === "string") rf.whyItMatters = softenIntent(rf.whyItMatters);
@@ -136,62 +144,29 @@ function buildUserMessage(params: {
 }): string {
   const { requestId, mode, normalizedText, context } = params;
 
-  // Keep this short. The real rules live in SYSTEM_PROMPT.
-  // This message just anchors the schema + mode limits.
-  const schema = {
-    ok: true,
-    requestId,
-    meta: { tone: "VOUVOIEMENT", version: "analyze_v3_3_1", mode },
-    source: { url: null, provider: "leboncoin", capturedAt: null },
-    verdict: { decision: "VISITEZ|NÉGOCIEZ|ÉCARTEZ", signals: "PRÉCIS|PARTIEL|FLOU", signalWhy: ["..."], oneLine: "..." },
-    narrativeReading: {
-      whatYouReallyBuy: "...",
-      blindSpots: [{ topic: "...", whatsMissing: "...", whyItCosts: "..." }],
-      priceBasis: "...",
-    },
-    dimensionScores: [{ axis: "readability", score: 1, comment: "..." }],
-    proofs: {
-      quickFacts: [{ label: "...", value: "..." }],
-      priceDefensibility: { status: "DÉFENDABLE|FRAGILE|INJUSTIFIABLE", rationale: ["..."] },
-      documentsIndex: [{ doc: "...", status: "OK|MISSING|UNKNOWN", why: "..." }],
-    },
-    reasons: [{ title: "...", impact: "...", evidence: ["..."] }],
-    redFlags: [{ label: "...", severity: "LOW|MEDIUM|HIGH", whyItMatters: "...", ask: "..." }],
-    ammo: {
-      asks: [{ title: "...", priority: "P0|P1|P2", whatToRequest: ["..."], why: "..." }],
-      preVisitQuestions: [{ question: "...", whyBeforeVisit: "..." }],
-      visitChecklist: [{ q: "...", tag: "..." }],
-    },
-    offer: { available: true, positioning: "...", scenarios: [{ name: "...", offerEUR: null, conditions: ["..."], whyThisWorks: "..." }], agentMessageTemplate: "..." },
-    cta: { primary: { label: "...", action: "NEW_SCAN|COPY_AGENT_MESSAGE" }, secondary: { label: "...", action: "NEW_SCAN|UPSELL_OFFER_DOSSIER|SUBSCRIBE" } },
-    disclaimer: ["..."],
-  };
-
   const compactLimits =
     mode === "COMPACT"
-      ? `
-MODE COMPACT LIMITS (strict):
-- reasons: 2 max
-- redFlags: 2 max
-- proofs.quickFacts: 4 max
-- proofs.documentsIndex: 2 max
-- narrativeReading.blindSpots: 3 max
-- ammo.asks: 3 max
-- ammo.preVisitQuestions: 3 max
-- ammo.visitChecklist: 5 max
-`
-      : "";
+      ? "COMPACT limits: reasons<=2, redFlags<=2, proofs.quickFacts<=4, proofs.documentsIndex<=2, narrativeReading.blindSpots=3 exactly, ammo.asks<=3, ammo.preVisitQuestions<=3, ammo.visitChecklist<=5."
+      : "DOSSIER mode.";
 
-  return (
-    `Répondez UNIQUEMENT en JSON valide. Aucun texte avant/après.\n` +
-    `requestId="${requestId}" mode="${mode}".\n` +
-    compactLimits +
-    `Schéma attendu (clés exactes, types exacts) :\n` +
-    JSON.stringify(schema, null, 2) +
-    `\n\nAnnonce (normalizedText) :\n` +
-    normalizedText +
-    (context ? `\n\ncontext:\n${JSON.stringify(context)}` : "")
-  );
+  return [
+    "JSON ONLY. No text outside JSON.",
+    `requestId="${requestId}"`,
+    `mode="${mode}"`,
+    compactLimits,
+    'Use enums with accents exactly: decision="VISITEZ|NÉGOCIEZ|ÉCARTEZ", signals="PRÉCIS|PARTIEL|FLOU", status="DÉFENDABLE|FRAGILE|INJUSTIFIABLE".',
+    "Return keys exactly: ok, requestId, meta{tone,version,mode}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer.",
+    context ? `context=${JSON.stringify(context)}` : "",
+    `normalizedText:\n${normalizedText}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function supportsJsonResponseFormat(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Heuristic: SDK throws when "response_format" is unknown/invalid.
+  return !/response_format|unknown field|unrecognized|invalid.*response_format/i.test(msg);
 }
 
 // --- Main handler ---
@@ -234,43 +209,65 @@ export async function POST(req: NextRequest) {
 
   const client = new Anthropic({ apiKey });
 
-  let rawText: string;
+  let rawText = "";
+  let parsed: unknown | null = null;
+
+  // Attempt #1 (try response_format json_object, then fallback if unsupported)
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-    const response = await client.messages.create(
-      {
-        model: MODEL,
-        max_tokens: maxTokens,
-        temperature: TEMPERATURE,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userMessage }],
-      },
-      { signal: controller.signal }
-    );
+    try {
+      const response = await client.messages.create(
+        {
+          model: MODEL,
+          max_tokens: maxTokens,
+          temperature: TEMPERATURE,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userMessage }],
+          // If supported by your Anthropic SDK/model, this dramatically reduces BAD_JSON
+          response_format: { type: "json_object" } as any,
+        },
+        { signal: controller.signal }
+      );
 
-    clearTimeout(timeout);
+      const textBlock = response.content.find((b) => b.type === "text");
+      rawText = (textBlock && textBlock.type === "text") ? textBlock.text : "";
+      parsed = safeJsonParse(rawText);
+    } catch (e) {
+      // If response_format isn't supported, retry once without it inside this attempt
+      if (!supportsJsonResponseFormat(e)) throw e;
 
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (!textBlock || textBlock.type !== "text") {
-      return errorResponse("SERVER_ERROR", "Réponse vide du modèle.", 500);
+      const response = await client.messages.create(
+        {
+          model: MODEL,
+          max_tokens: maxTokens,
+          temperature: TEMPERATURE,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userMessage }],
+        },
+        { signal: controller.signal }
+      );
+
+      const textBlock = response.content.find((b) => b.type === "text");
+      rawText = (textBlock && textBlock.type === "text") ? textBlock.text : "";
+      parsed = safeJsonParse(rawText);
+    } finally {
+      clearTimeout(timeout);
     }
-    rawText = textBlock.text;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Erreur API";
     console.error("[IMOSCAN] Claude API error:", message);
-    if (message.includes("abort")) {
+    if (String(message).includes("abort")) {
       return errorResponse("TIMEOUT", "Délai dépassé. Réessayez.", 504);
     }
     return errorResponse("SERVER_ERROR", "Erreur d'analyse. Réessayez.", 500);
   }
 
-  let parsed = safeJsonParse(rawText);
-
   // Retry once if BAD_JSON
   if (!parsed) {
     console.warn("[IMOSCAN] BAD_JSON on first attempt, retrying...");
+
     try {
       const retryResponse = await client.messages.create({
         model: MODEL,
@@ -283,15 +280,15 @@ export async function POST(req: NextRequest) {
           {
             role: "user",
             content:
-              "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après.",
+              "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après. Pas de markdown.",
           },
         ],
+        response_format: { type: "json_object" } as any,
       });
 
       const retryBlock = retryResponse.content.find((b) => b.type === "text");
-      if (retryBlock && retryBlock.type === "text") {
-        parsed = safeJsonParse(retryBlock.text);
-      }
+      const retryText = retryBlock && retryBlock.type === "text" ? retryBlock.text : "";
+      parsed = safeJsonParse(retryText);
     } catch (retryErr) {
       console.error("[IMOSCAN] Retry failed:", retryErr);
     }
@@ -319,7 +316,7 @@ export async function POST(req: NextRequest) {
   result._latencyMs = Date.now() - startTime;
   result._engine = "claude-solo";
   result._model = MODEL;
-  result._promptVersion = "IMOSCAN_V3.3.1";
+  result._promptVersion = "IMOSCAN_V3.3.2_BRUTAL";
 
   return NextResponse.json(result, {
     status: 200,
