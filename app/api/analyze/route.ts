@@ -8,11 +8,14 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 900;
+const MAX_TOKENS_COMPACT = 2000;
 const MAX_TOKENS_DOSSIER = 4000;
-const TEMPERATURE = 0.2;
+const TEMPERATURE = 0.15;
 const TIMEOUT_MS = 55_000;
 const MIN_TEXT_LENGTH = 100;
+
+const PROMPT_VERSION = "IMOSCAN_V3.4_PHOTOSCAN";
+const META_VERSION = "analyze_v3_4";
 
 // --- CORS preflight ---
 export async function OPTIONS() {
@@ -90,13 +93,23 @@ function sanitizeOutput(data: unknown): void {
   const d = data as any;
   if (!d || typeof d !== "object") return;
 
+  // Ensure meta fields exist & are coherent
+  d.meta = d.meta && typeof d.meta === "object" ? d.meta : {};
+  d.meta.tone = "VOUVOIEMENT";
+  d.meta.version = META_VERSION;
+  // Keep mode if model provided; route will not invent if missing
+  if (d.meta.mode !== "COMPACT" && d.meta.mode !== "DOSSIER") {
+    // fallback to COMPACT if absent
+    d.meta.mode = "COMPACT";
+  }
+
   const fixTypos = (s: string): string =>
     s.replace(/compl[eè]vos/gi, "complètes").replace(/compl[eè]ves/gi, "complètes");
 
   // Light “intent” softener (server-side guardrail)
   const softenIntent = (s: string): string =>
     s
-      .replace(/\b[Ss]trat(?:e|é|è)gie\b/g, "Opacité")
+      .replace(/\b[Ss]trat(?:e|é|è)gie\b/gi, "Opacité")
       .replace(/\bmanipulation\b/gi, "asymétrie d'information")
       .replace(/\b(suspect|suspecte|suspects|suspectes)\b/gi, "non vérifiable")
       .replace(/\bmasquer\b/gi, "couvrir")
@@ -140,9 +153,12 @@ function buildUserMessage(params: {
   requestId: string;
   mode: "COMPACT" | "DOSSIER";
   normalizedText: string;
+  source?: unknown;
+  extracted?: unknown;
+  photoContext?: unknown;
   context?: unknown;
 }): string {
-  const { requestId, mode, normalizedText, context } = params;
+  const { requestId, mode, normalizedText, source, extracted, photoContext, context } = params;
 
   const compactLimits =
     mode === "COMPACT"
@@ -155,7 +171,11 @@ function buildUserMessage(params: {
     `mode="${mode}"`,
     compactLimits,
     'Use enums with accents exactly: decision="VISITEZ|NÉGOCIEZ|ÉCARTEZ", signals="PRÉCIS|PARTIEL|FLOU", status="DÉFENDABLE|FRAGILE|INJUSTIFIABLE".',
-    "Return keys exactly: ok, requestId, meta{tone,version,mode}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer.",
+    `meta.version must be "${META_VERSION}". meta.tone must be "VOUVOIEMENT".`,
+    "Return keys exactly: ok, requestId, meta{tone,version,mode,captureMethod?}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale,ranges?},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer, photoScan?.",
+    source ? `source=${JSON.stringify(source)}` : "",
+    extracted ? `extracted=${JSON.stringify(extracted)}` : "",
+    photoContext ? `photoContext=${JSON.stringify(photoContext)}` : "",
     context ? `context=${JSON.stringify(context)}` : "",
     `normalizedText:\n${normalizedText}`,
   ]
@@ -163,30 +183,43 @@ function buildUserMessage(params: {
     .join("\n");
 }
 
-function supportsJsonResponseFormat(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  // Heuristic: SDK throws when "response_format" is unknown/invalid.
-  return !/response_format|unknown field|unrecognized|invalid.*response_format/i.test(msg);
-}
-
 // --- Main handler ---
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
 
-  let body: { normalizedText?: string; mode?: string; context?: unknown };
+  let body: {
+    normalizedText?: string;
+    mode?: string;
+    source?: unknown;
+    extracted?: unknown;
+    photoContext?: unknown;
+    context?: unknown;
+  };
+
   try {
     body = await req.json();
   } catch {
     return errorResponse("BAD_INPUT", "Corps de requête invalide.", 400);
   }
 
-  const { normalizedText, mode = "COMPACT", context } = body;
+  const {
+    normalizedText,
+    mode = "COMPACT",
+    source,
+    extracted,
+    photoContext,
+    context,
+  } = body;
 
   if (!normalizedText || typeof normalizedText !== "string") {
     return errorResponse("BAD_INPUT", "normalizedText requis.", 400);
   }
   if (normalizedText.length < MIN_TEXT_LENGTH) {
-    return errorResponse("TOO_SHORT", "Texte trop court. Collez l'annonce complète.", 400);
+    return errorResponse(
+      "TOO_SHORT",
+      "Texte trop court. Utilisez extension/webview/bookmarklet pour capturer l'annonce complète.",
+      400
+    );
   }
   if (!["COMPACT", "DOSSIER"].includes(mode)) {
     return errorResponse("BAD_INPUT", "mode doit être COMPACT ou DOSSIER.", 400);
@@ -204,6 +237,9 @@ export async function POST(req: NextRequest) {
     requestId,
     mode: mode as "COMPACT" | "DOSSIER",
     normalizedText,
+    source,
+    extracted,
+    photoContext,
     context,
   });
 
@@ -212,49 +248,27 @@ export async function POST(req: NextRequest) {
   let rawText = "";
   let parsed: unknown | null = null;
 
-  // Attempt #1 (try response_format json_object, then fallback if unsupported)
+  // Attempt #1
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), TIMEOUT_MS);
 
-    try {
-      const response = await client.messages.create(
-        {
-          model: MODEL,
-          max_tokens: maxTokens,
-          temperature: TEMPERATURE,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: userMessage }],
-          // If supported by your Anthropic SDK/model, this dramatically reduces BAD_JSON
-          response_format: { type: "json_object" } as any,
-        },
-        { signal: controller.signal }
-      );
+    const response = await client.messages.create(
+      {
+        model: MODEL,
+        max_tokens: maxTokens,
+        temperature: TEMPERATURE,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: "user", content: userMessage }],
+      },
+      { signal: controller.signal }
+    );
 
-      const textBlock = response.content.find((b) => b.type === "text");
-      rawText = (textBlock && textBlock.type === "text") ? textBlock.text : "";
-      parsed = safeJsonParse(rawText);
-    } catch (e) {
-      // If response_format isn't supported, retry once without it inside this attempt
-      if (!supportsJsonResponseFormat(e)) throw e;
+    clearTimeout(timeout);
 
-      const response = await client.messages.create(
-        {
-          model: MODEL,
-          max_tokens: maxTokens,
-          temperature: TEMPERATURE,
-          system: SYSTEM_PROMPT,
-          messages: [{ role: "user", content: userMessage }],
-        },
-        { signal: controller.signal }
-      );
-
-      const textBlock = response.content.find((b) => b.type === "text");
-      rawText = (textBlock && textBlock.type === "text") ? textBlock.text : "";
-      parsed = safeJsonParse(rawText);
-    } finally {
-      clearTimeout(timeout);
-    }
+    const textBlock = response.content.find((b) => b.type === "text");
+    rawText = textBlock && textBlock.type === "text" ? textBlock.text : "";
+    parsed = safeJsonParse(rawText);
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : "Erreur API";
     console.error("[IMOSCAN] Claude API error:", message);
@@ -283,7 +297,6 @@ export async function POST(req: NextRequest) {
               "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après. Pas de markdown.",
           },
         ],
-        response_format: { type: "json_object" } as any,
       });
 
       const retryBlock = retryResponse.content.find((b) => b.type === "text");
@@ -316,7 +329,7 @@ export async function POST(req: NextRequest) {
   result._latencyMs = Date.now() - startTime;
   result._engine = "claude-solo";
   result._model = MODEL;
-  result._promptVersion = "IMOSCAN_V3.3.2_BRUTAL";
+  result._promptVersion = PROMPT_VERSION;
 
   return NextResponse.json(result, {
     status: 200,
