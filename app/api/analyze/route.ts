@@ -8,14 +8,14 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 3000; // ↑ was 900 -> avoids truncation / BAD_JSON
+const MAX_TOKENS_COMPACT = 3000;
 const MAX_TOKENS_DOSSIER = 4000;
-const TEMPERATURE = 0.15; // ↓ more stable JSON
+const TEMPERATURE = 0.15;
 const TIMEOUT_MS = 55_000;
 const MIN_TEXT_LENGTH = 100;
 
-const PROMPT_VERSION = "IMOSCAN_V3.4_PHOTOSCAN";
-const META_VERSION = "analyze_v3_4";
+const PROMPT_VERSION = "IMOSCAN_V3.4.1_HARDCORE";
+const META_VERSION = "analyze_v3_4_1";
 
 // --- CORS preflight ---
 export async function OPTIONS() {
@@ -60,8 +60,8 @@ function errorResponse(code: string, message: string, status: number) {
 }
 
 function normalizeEnums(data: unknown): void {
-  const d = data as Record<string, unknown>;
-  const verdict = d.verdict as Record<string, unknown> | undefined;
+  const d = data as Record<string, any>;
+  const verdict = d?.verdict;
 
   if (verdict) {
     const decisionMap: Record<string, string> = {
@@ -70,39 +70,103 @@ function normalizeEnums(data: unknown): void {
       "ÉCARTEZ": "ÉCARTEZ", // rare composed accent
     };
     const signalMap: Record<string, string> = { PRECIS: "PRÉCIS" };
-
-    if (typeof verdict.decision === "string" && decisionMap[verdict.decision]) {
-      verdict.decision = decisionMap[verdict.decision];
-    }
-    if (typeof verdict.signals === "string" && signalMap[verdict.signals]) {
-      verdict.signals = signalMap[verdict.signals];
-    }
+    if (typeof verdict.decision === "string" && decisionMap[verdict.decision]) verdict.decision = decisionMap[verdict.decision];
+    if (typeof verdict.signals === "string" && signalMap[verdict.signals]) verdict.signals = signalMap[verdict.signals];
   }
 
-  const proofs = d.proofs as Record<string, unknown> | undefined;
-  if (proofs) {
-    const pd = proofs.priceDefensibility as Record<string, unknown> | undefined;
+  const proofs = d?.proofs;
+  if (proofs?.priceDefensibility) {
+    const pd = proofs.priceDefensibility;
     const statusMap: Record<string, string> = { DEFENDABLE: "DÉFENDABLE" };
-    if (pd && typeof pd.status === "string" && statusMap[pd.status]) {
-      pd.status = statusMap[pd.status];
-    }
+    if (typeof pd.status === "string" && statusMap[pd.status]) pd.status = statusMap[pd.status];
   }
 }
 
-function sanitizeOutput(data: unknown, mode: "COMPACT" | "DOSSIER"): void {
-  const d = data as any;
-  if (!d || typeof d !== "object") return;
+function coerceScalpesFullToString(parsed: any): void {
+  const sf = parsed?.scalpesFull;
+  if (!sf) return;
 
-  // Ensure meta coherence server-side
-  d.meta = d.meta && typeof d.meta === "object" ? d.meta : {};
-  d.meta.tone = "VOUVOIEMENT";
-  d.meta.version = META_VERSION;
-  d.meta.mode = mode;
+  // already a string
+  if (typeof sf === "string") {
+    parsed.scalpesFull = sf;
+    return;
+  }
+
+  // object -> stringify to human-readable block (no markdown)
+  if (sf && typeof sf === "object") {
+    const hook = typeof sf.hook === "string" ? sf.hook.trim() : "";
+    const mech = typeof sf.mechanism === "string" ? sf.mechanism.trim() : "";
+    const whatBreaks = Array.isArray(sf.whatBreaks) ? sf.whatBreaks.filter((x: any) => typeof x === "string").slice(0, 3) : [];
+    const whatYouMustProve = Array.isArray(sf.whatYouMustProve)
+      ? sf.whatYouMustProve.filter((x: any) => typeof x === "string").slice(0, 3)
+      : [];
+    const blade = typeof sf.verdictBlade === "string" ? sf.verdictBlade.trim() : "";
+
+    const lines: string[] = [];
+    if (hook) lines.push(hook);
+    if (mech) lines.push(mech);
+    if (whatBreaks.length) {
+      lines.push("Ce qui casse :");
+      for (const w of whatBreaks) lines.push(`- ${w}`);
+    }
+    if (whatYouMustProve.length) {
+      lines.push("Ce que vous devez prouver :");
+      for (const w of whatYouMustProve) lines.push(`- ${w}`);
+    }
+    if (blade) lines.push(blade);
+
+    parsed.scalpesFull = lines.join("\n");
+    return;
+  }
+
+  // unknown type -> drop
+  delete parsed.scalpesFull;
+}
+
+function normalizeCrucialPoints(parsed: any): void {
+  const cps = parsed?.crucialPoints;
+  if (!Array.isArray(cps)) return;
+
+  const clean = cps
+    .map((x: any) => {
+      if (!x || typeof x !== "object") return null;
+      const title = typeof x.title === "string" ? x.title.trim() : "";
+      const why = typeof x.why === "string" ? x.why.trim() : "";
+      const demand = typeof x.demand === "string" ? x.demand.trim() : "";
+      const severity = typeof x.severity === "string" ? x.severity.trim().toUpperCase() : "MEDIUM";
+      const sev = severity === "HIGH" || severity === "LOW" ? severity : "MEDIUM";
+      if (!title || !why || !demand) return null;
+      return { title, why, demand, severity: sev };
+    })
+    .filter(Boolean)
+    .slice(0, 5);
+
+  parsed.crucialPoints = clean;
+}
+
+function sanitizeOutput(parsed: any, mode: "COMPACT" | "DOSSIER", captureMethod?: string): void {
+  if (!parsed || typeof parsed !== "object") return;
+
+  // Force meta coherence server-side
+  parsed.meta = parsed.meta && typeof parsed.meta === "object" ? parsed.meta : {};
+  parsed.meta.tone = "VOUVOIEMENT";
+  parsed.meta.version = META_VERSION;
+  parsed.meta.mode = mode;
+  if (captureMethod) parsed.meta.captureMethod = captureMethod;
+
+  // Force disclaimer standard
+  parsed.disclaimer = [
+    "IMOSCAN est une aide à la décision. Pas une garantie.",
+    "IMOSCAN tranche sur ce qui est visible et fourni.",
+  ];
 
   const fixTypos = (s: string): string =>
-    s.replace(/compl[eè]vos/gi, "complètes").replace(/compl[eè]ves/gi, "complètes");
+    s
+      .replace(/compl[eè]vos/gi, "complètes")
+      .replace(/compl[eè]ves/gi, "complètes")
+      .replace(/compl[\u00E8e]v?os/gi, "complètes")
+      .replace(/compl[\u00E8e]t?os/gi, "complètes");
 
-  // Light “intent” softener (server-side guardrail)
   const softenIntent = (s: string): string =>
     s
       .replace(/\b[Ss]trat(?:e|é|è)gie\b/gi, "Opacité")
@@ -112,37 +176,50 @@ function sanitizeOutput(data: unknown, mode: "COMPACT" | "DOSSIER"): void {
       .replace(/\b(cach(e|er|ée|ées|és)|dissimule|rétention|retention)\b/gi, "non documenté")
       .replace(/\b(evitement|évitement)\b/gi, "opacité");
 
-  // Fix ammo.asks[].title + soften why
-  if (d.ammo?.asks && Array.isArray(d.ammo.asks)) {
-    for (const ask of d.ammo.asks) {
+  // Fix ammo asks typos + soften whys
+  if (parsed.ammo?.asks && Array.isArray(parsed.ammo.asks)) {
+    for (const ask of parsed.ammo.asks) {
       if (ask && typeof ask.title === "string") ask.title = fixTypos(ask.title);
-      if (ask && typeof ask.why === "string") ask.why = softenIntent(ask.why);
+      if (ask && typeof ask.item === "string") ask.item = fixTypos(ask.item);
+      if (ask && typeof ask.why === "string") ask.why = softenIntent(fixTypos(ask.why));
+      if (ask && Array.isArray(ask.whatToRequest)) {
+        ask.whatToRequest = ask.whatToRequest.map((w: any) => (typeof w === "string" ? fixTypos(w) : w));
+      }
     }
   }
 
   // Soften intent-ish phrasing in redFlags/reasons
-  if (d.redFlags && Array.isArray(d.redFlags)) {
-    for (const rf of d.redFlags) {
-      if (rf && typeof rf.whyItMatters === "string") rf.whyItMatters = softenIntent(rf.whyItMatters);
+  if (parsed.redFlags && Array.isArray(parsed.redFlags)) {
+    for (const rf of parsed.redFlags) {
+      if (rf && typeof rf.whyItMatters === "string") rf.whyItMatters = softenIntent(fixTypos(rf.whyItMatters));
+      if (rf && typeof rf.label === "string") rf.label = fixTypos(rf.label);
+      if (rf && typeof rf.ask === "string") rf.ask = fixTypos(rf.ask);
     }
   }
-  if (d.reasons && Array.isArray(d.reasons)) {
-    for (const r of d.reasons) {
-      if (r && typeof r.impact === "string") r.impact = softenIntent(r.impact);
+  if (parsed.reasons && Array.isArray(parsed.reasons)) {
+    for (const r of parsed.reasons) {
+      if (r && typeof r.impact === "string") r.impact = softenIntent(fixTypos(r.impact));
+      if (r && typeof r.title === "string") r.title = fixTypos(r.title);
+      if (r && Array.isArray(r.evidence)) {
+        r.evidence = r.evidence.map((e: any) => (typeof e === "string" ? fixTypos(e) : e));
+      }
     }
   }
 
+  // Fix typos in offer agent message
+  if (parsed.offer && typeof parsed.offer.agentMessageTemplate === "string") {
+    parsed.offer.agentMessageTemplate = fixTypos(parsed.offer.agentMessageTemplate);
+  }
+
   // Force CTA coherence (server-side truth)
-  const decision: string | undefined = d.verdict?.decision;
-  if (!d.cta) d.cta = {};
-  if (decision) {
-    if (decision === "ÉCARTEZ" || decision === "ECARTEZ") {
-      d.cta.primary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
-      delete d.cta.secondary;
-    } else {
-      d.cta.primary = { label: "Copier le message agent", action: "COPY_AGENT_MESSAGE" };
-      d.cta.secondary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
-    }
+  const decision: string | undefined = parsed?.verdict?.decision;
+  parsed.cta = parsed.cta && typeof parsed.cta === "object" ? parsed.cta : {};
+  if (decision === "ÉCARTEZ") {
+    parsed.cta.primary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
+    delete parsed.cta.secondary;
+  } else {
+    parsed.cta.primary = { label: "Copier le message agent", action: "COPY_AGENT_MESSAGE" };
+    parsed.cta.secondary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
   }
 }
 
@@ -150,16 +227,16 @@ function buildUserMessage(params: {
   requestId: string;
   mode: "COMPACT" | "DOSSIER";
   normalizedText: string;
-  source?: unknown;
-  extracted?: unknown;
-  photoContext?: unknown;
-  context?: unknown;
+  source?: any;
+  extracted?: any;
+  photoContext?: any;
+  context?: any;
 }): string {
   const { requestId, mode, normalizedText, source, extracted, photoContext, context } = params;
 
   const compactLimits =
     mode === "COMPACT"
-      ? "COMPACT limits: reasons<=2, redFlags<=2, proofs.quickFacts<=4, proofs.documentsIndex<=2, narrativeReading.blindSpots=3 exactly, ammo.asks<=3, ammo.preVisitQuestions<=3, ammo.visitChecklist<=5."
+      ? "COMPACT limits: reasons<=2, redFlags<=2, proofs.quickFacts<=4, proofs.documentsIndex<=2, narrativeReading.blindSpots=3 exactly, ammo.asks<=3, ammo.preVisitQuestions<=3, ammo.visitChecklist<=5, crucialPoints=3..5."
       : "DOSSIER mode.";
 
   return [
@@ -169,8 +246,7 @@ function buildUserMessage(params: {
     `meta.version MUST be "${META_VERSION}". meta.tone MUST be "VOUVOIEMENT".`,
     compactLimits,
     'Use enums with accents exactly: decision="VISITEZ|NÉGOCIEZ|ÉCARTEZ", signals="PRÉCIS|PARTIEL|FLOU", status="DÉFENDABLE|FRAGILE|INJUSTIFIABLE".',
-    "COMPACT: keep EVERY string field to 1 sentence max. Ultra short.",
-    "Return keys exactly: ok, requestId, meta{tone,version,mode,captureMethod?}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale,ranges?},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer, photoScan?.",
+    "Return keys exactly: ok, requestId, meta{tone,version,mode,captureMethod?}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale,ranges?},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer, photoScan?, scalpesFull, crucialPoints.",
     source ? `source=${JSON.stringify(source)}` : "",
     extracted ? `extracted=${JSON.stringify(extracted)}` : "",
     photoContext ? `photoContext=${JSON.stringify(photoContext)}` : "",
@@ -188,10 +264,10 @@ export async function POST(req: NextRequest) {
   let body: {
     normalizedText?: string;
     mode?: string;
-    source?: unknown;
-    extracted?: unknown;
-    photoContext?: unknown;
-    context?: unknown;
+    source?: any;
+    extracted?: any;
+    photoContext?: any;
+    context?: any;
   };
 
   try {
@@ -237,6 +313,7 @@ export async function POST(req: NextRequest) {
   const client = new Anthropic({ apiKey });
 
   let rawText = "";
+  let retryText = "";
   let parsed: unknown | null = null;
 
   // Attempt #1
@@ -270,7 +347,6 @@ export async function POST(req: NextRequest) {
   }
 
   // Retry once if BAD_JSON
-  let retryText = "";
   if (!parsed) {
     console.warn("[IMOSCAN] BAD_JSON on first attempt, retrying...");
 
@@ -285,8 +361,7 @@ export async function POST(req: NextRequest) {
           { role: "assistant", content: rawText },
           {
             role: "user",
-            content:
-              "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après. Pas de markdown.",
+            content: "Votre réponse précédente n'est pas un JSON valide. Renvoyez UNIQUEMENT le JSON corrigé, sans texte avant ou après. Pas de markdown.",
           },
         ],
       });
@@ -299,7 +374,6 @@ export async function POST(req: NextRequest) {
     }
 
     if (!parsed) {
-      // P0 DEBUG LOGS: inspect what the model actually returned
       console.log("[IMOSCAN] BAD_JSON rawText len:", rawText.length);
       console.log("[IMOSCAN] BAD_JSON rawText first 800:\n", rawText.slice(0, 800));
       console.log("[IMOSCAN] BAD_JSON rawText last 800:\n", rawText.slice(-800));
@@ -312,8 +386,13 @@ export async function POST(req: NextRequest) {
   }
 
   // Normalize & sanitize before validation
+  const captureMethod = source?.captureMethod;
   normalizeEnums(parsed);
-  sanitizeOutput(parsed, mode as "COMPACT" | "DOSSIER");
+  sanitizeOutput(parsed as any, mode as "COMPACT" | "DOSSIER", typeof captureMethod === "string" ? captureMethod : undefined);
+
+  // HARDCORE additions normalization
+  coerceScalpesFullToString(parsed as any);
+  normalizeCrucialPoints(parsed as any);
 
   // Validate (non-blocking warning for now)
   const validation = validateAnalyzeResult(parsed);
