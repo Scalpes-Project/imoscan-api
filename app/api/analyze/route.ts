@@ -8,9 +8,9 @@ import { validateAnalyzeResult } from "@/lib/validator";
 
 // --- Config ---
 const MODEL = "claude-sonnet-4-20250514";
-const MAX_TOKENS_COMPACT = 2000;
+const MAX_TOKENS_COMPACT = 3000; // ↑ was 900 -> avoids truncation / BAD_JSON
 const MAX_TOKENS_DOSSIER = 4000;
-const TEMPERATURE = 0.15;
+const TEMPERATURE = 0.15; // ↓ more stable JSON
 const TIMEOUT_MS = 55_000;
 const MIN_TEXT_LENGTH = 100;
 
@@ -31,14 +31,14 @@ export async function OPTIONS() {
 
 // --- Helpers ---
 function safeJsonParse(raw: string): unknown | null {
-  let cleaned = raw.trim();
+  let cleaned = (raw ?? "").trim();
 
   // Strip fenced code blocks if present
   if (cleaned.startsWith("```")) {
     cleaned = cleaned.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
   }
 
-  // Try to extract JSON object boundaries if extra text exists
+  // Extract JSON object boundaries if extra text exists
   const firstBrace = cleaned.indexOf("{");
   const lastBrace = cleaned.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
@@ -89,19 +89,15 @@ function normalizeEnums(data: unknown): void {
   }
 }
 
-function sanitizeOutput(data: unknown): void {
+function sanitizeOutput(data: unknown, mode: "COMPACT" | "DOSSIER"): void {
   const d = data as any;
   if (!d || typeof d !== "object") return;
 
-  // Ensure meta fields exist & are coherent
+  // Ensure meta coherence server-side
   d.meta = d.meta && typeof d.meta === "object" ? d.meta : {};
   d.meta.tone = "VOUVOIEMENT";
   d.meta.version = META_VERSION;
-  // Keep mode if model provided; route will not invent if missing
-  if (d.meta.mode !== "COMPACT" && d.meta.mode !== "DOSSIER") {
-    // fallback to COMPACT if absent
-    d.meta.mode = "COMPACT";
-  }
+  d.meta.mode = mode;
 
   const fixTypos = (s: string): string =>
     s.replace(/compl[eè]vos/gi, "complètes").replace(/compl[eè]ves/gi, "complètes");
@@ -138,7 +134,8 @@ function sanitizeOutput(data: unknown): void {
 
   // Force CTA coherence (server-side truth)
   const decision: string | undefined = d.verdict?.decision;
-  if (d.cta && decision) {
+  if (!d.cta) d.cta = {};
+  if (decision) {
     if (decision === "ÉCARTEZ" || decision === "ECARTEZ") {
       d.cta.primary = { label: "Scanner une autre annonce", action: "NEW_SCAN" };
       delete d.cta.secondary;
@@ -166,12 +163,13 @@ function buildUserMessage(params: {
       : "DOSSIER mode.";
 
   return [
-    "JSON ONLY. No text outside JSON.",
+    "JSON ONLY. No text outside JSON. No markdown.",
     `requestId="${requestId}"`,
     `mode="${mode}"`,
+    `meta.version MUST be "${META_VERSION}". meta.tone MUST be "VOUVOIEMENT".`,
     compactLimits,
     'Use enums with accents exactly: decision="VISITEZ|NÉGOCIEZ|ÉCARTEZ", signals="PRÉCIS|PARTIEL|FLOU", status="DÉFENDABLE|FRAGILE|INJUSTIFIABLE".',
-    `meta.version must be "${META_VERSION}". meta.tone must be "VOUVOIEMENT".`,
+    "COMPACT: keep EVERY string field to 1 sentence max. Ultra short.",
     "Return keys exactly: ok, requestId, meta{tone,version,mode,captureMethod?}, source{url,provider,capturedAt}, verdict{decision,signals,signalWhy,oneLine}, narrativeReading{whatYouReallyBuy,blindSpots,priceBasis}, dimensionScores[{axis,score,comment}], proofs{quickFacts,priceDefensibility{status,rationale,ranges?},documentsIndex}, reasons, redFlags, ammo{asks,preVisitQuestions,visitChecklist}, offer{available,positioning,scenarios,agentMessageTemplate}, cta, disclaimer, photoScan?.",
     source ? `source=${JSON.stringify(source)}` : "",
     extracted ? `extracted=${JSON.stringify(extracted)}` : "",
@@ -202,14 +200,7 @@ export async function POST(req: NextRequest) {
     return errorResponse("BAD_INPUT", "Corps de requête invalide.", 400);
   }
 
-  const {
-    normalizedText,
-    mode = "COMPACT",
-    source,
-    extracted,
-    photoContext,
-    context,
-  } = body;
+  const { normalizedText, mode = "COMPACT", source, extracted, photoContext, context } = body;
 
   if (!normalizedText || typeof normalizedText !== "string") {
     return errorResponse("BAD_INPUT", "normalizedText requis.", 400);
@@ -279,6 +270,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Retry once if BAD_JSON
+  let retryText = "";
   if (!parsed) {
     console.warn("[IMOSCAN] BAD_JSON on first attempt, retrying...");
 
@@ -300,20 +292,28 @@ export async function POST(req: NextRequest) {
       });
 
       const retryBlock = retryResponse.content.find((b) => b.type === "text");
-      const retryText = retryBlock && retryBlock.type === "text" ? retryBlock.text : "";
+      retryText = retryBlock && retryBlock.type === "text" ? retryBlock.text : "";
       parsed = safeJsonParse(retryText);
     } catch (retryErr) {
       console.error("[IMOSCAN] Retry failed:", retryErr);
     }
 
     if (!parsed) {
+      // P0 DEBUG LOGS: inspect what the model actually returned
+      console.log("[IMOSCAN] BAD_JSON rawText len:", rawText.length);
+      console.log("[IMOSCAN] BAD_JSON rawText first 800:\n", rawText.slice(0, 800));
+      console.log("[IMOSCAN] BAD_JSON rawText last 800:\n", rawText.slice(-800));
+      console.log("[IMOSCAN] BAD_JSON retryText len:", retryText.length);
+      console.log("[IMOSCAN] BAD_JSON retryText first 800:\n", retryText.slice(0, 800));
+      console.log("[IMOSCAN] BAD_JSON retryText last 800:\n", retryText.slice(-800));
+
       return errorResponse("BAD_JSON", "Impossible de produire un verdict valide. Réessayez.", 500);
     }
   }
 
   // Normalize & sanitize before validation
   normalizeEnums(parsed);
-  sanitizeOutput(parsed);
+  sanitizeOutput(parsed, mode as "COMPACT" | "DOSSIER");
 
   // Validate (non-blocking warning for now)
   const validation = validateAnalyzeResult(parsed);
@@ -330,15 +330,6 @@ export async function POST(req: NextRequest) {
   result._engine = "claude-solo";
   result._model = MODEL;
   result._promptVersion = PROMPT_VERSION;
-
-  // TEMP DEBUG MARKER
-  (result as any)._server = {
-    maxTokensCompact: MAX_TOKENS_COMPACT,
-    maxTokensDossier: MAX_TOKENS_DOSSIER,
-    temperature: TEMPERATURE,
-    metaVersion: META_VERSION,
-    promptVersion: PROMPT_VERSION,
-  };
 
   return NextResponse.json(result, {
     status: 200,
