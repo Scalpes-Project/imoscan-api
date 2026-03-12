@@ -235,15 +235,13 @@ ${normalizedText}`;
     (parsed as Record<string, unknown>)._warnings = validation.errors;
   }
 
-  const normalized = normalizeJsonStringsVouvoiement(parsed);
+const result = normalized as Record<string, unknown>;
+result._latencyMs = Date.now() - startTime;
+result._engine = "claude-solo";
+result._model = MODEL;
+result._promptVersion = "IMOSCAN_V3.3.1"; // <-- ADD THIS
 
-  const result = normalized as Record<string, unknown>;
-  result._latencyMs = Date.now() - startTime;
-  result._engine = "claude-solo";
-  result._model = MODEL;
-
-  return NextResponse.json(result, {
-    status: 200,
-    headers: { "Access-Control-Allow-Origin": "*" },
-  });
-}
+return NextResponse.json(result, {
+  status: 200,
+  headers: { "Access-Control-Allow-Origin": "*" },
+});
