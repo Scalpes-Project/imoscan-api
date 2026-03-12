@@ -331,6 +331,15 @@ export async function POST(req: NextRequest) {
   result._model = MODEL;
   result._promptVersion = PROMPT_VERSION;
 
+  // TEMP DEBUG MARKER
+  (result as any)._server = {
+    maxTokensCompact: MAX_TOKENS_COMPACT,
+    maxTokensDossier: MAX_TOKENS_DOSSIER,
+    temperature: TEMPERATURE,
+    metaVersion: META_VERSION,
+    promptVersion: PROMPT_VERSION,
+  };
+
   return NextResponse.json(result, {
     status: 200,
     headers: { "Access-Control-Allow-Origin": "*" },
